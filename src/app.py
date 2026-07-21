@@ -1,7 +1,40 @@
 import os
 import time
 import json
+import tempfile
+from pathlib import Path
+from urllib.parse import urlparse
+
+import boto3
 import polars as pl
+
+
+def _upload_to_s3(local_path, s3_uri):
+    parsed = urlparse(s3_uri)
+    if parsed.scheme != "s3":
+        raise ValueError(f"Unsupported S3 URI: {s3_uri}")
+
+    bucket = parsed.netloc
+    key = parsed.path.lstrip("/")
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "eu-north-1"
+
+    s3_client = boto3.client("s3", region_name=region)
+    s3_client.upload_file(str(local_path), bucket, key)
+    return s3_uri
+
+
+def _download_from_s3(s3_uri, destination_path):
+    parsed = urlparse(s3_uri)
+    if parsed.scheme != "s3":
+        raise ValueError(f"Unsupported S3 URI: {s3_uri}")
+
+    bucket = parsed.netloc
+    key = parsed.path.lstrip("/")
+    region = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "eu-north-1"
+
+    s3_client = boto3.client("s3", region_name=region)
+    s3_client.download_file(bucket, key, str(destination_path))
+    return destination_path
 
 
 def execute_etl_pipeline():
@@ -18,28 +51,42 @@ def execute_etl_pipeline():
     
     # Start the monotonic benchmarking clock
     start_time = time.monotonic()
-    
-    # 1. EXTRACT & TRANSFORM (Utilising Polars LazyFrames for optimization)
-    # Specifying storage_options allows Polars to natively use the container/lambda IAM role permissions
-    lazy_df = (
-        pl.scan_csv(input_uri, low_memory=True)
-        # Drop rows containing any null values
-        .drop_nulls()
-        # GroupBy categorical configurations specified in dissertation scope
-        .group_by(["VendorID", "payment_type", "passenger_count"])
-        # Aggregate required operational metrics
-        .agg([
-            pl.len().alias("trip_count"),
-            pl.col("fare_amount").mean().alias("avg_fare"),
-            pl.col("trip_distance").mean().alias("avg_distance"),
-            pl.col("tip_amount").mean().alias("avg_tip")
-        ])
-    )
-    
-    # 2. LOAD
-    print(f"Loading and writing Parquet directly to: {output_uri}")
-    # collect(streaming=True) forces Polars to process data in chunks, minimizing RAM spikes
-    lazy_df.collect(streaming=True).write_parquet(output_uri)
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_dir_path = Path(temp_dir)
+        input_path = temp_dir_path / "input.csv"
+        output_path = temp_dir_path / "output.parquet"
+
+        parsed_input = urlparse(input_uri)
+        if parsed_input.scheme == "s3":
+            print(f"Downloading input file from S3 to local temp storage")
+            _download_from_s3(input_uri, input_path)
+        else:
+            input_path = Path(input_uri)
+
+        # 1. EXTRACT & TRANSFORM (Utilising Polars LazyFrames for optimization)
+        lazy_df = (
+            pl.scan_csv(input_path, low_memory=True)
+            # Drop rows containing any null values
+            .drop_nulls()
+            # GroupBy categorical configurations specified in dissertation scope
+            .group_by(["VendorID", "payment_type", "passenger_count"])
+            # Aggregate required operational metrics
+            .agg([
+                pl.len().alias("trip_count"),
+                pl.col("fare_amount").mean().alias("avg_fare"),
+                pl.col("trip_distance").mean().alias("avg_distance"),
+                pl.col("tip_amount").mean().alias("avg_tip")
+            ])
+        )
+
+        # 2. LOAD
+        print(f"Writing temporary Parquet locally before uploading to: {output_uri}")
+        # collect(streaming=True) forces Polars to process data in chunks, minimizing RAM spikes
+        lazy_df.collect(streaming=True).write_parquet(output_path)
+
+        print(f"Uploading Parquet to S3: {output_uri}")
+        _upload_to_s3(output_path, output_uri)
     
     end_time = time.monotonic()
     execution_duration = end_time - start_time
